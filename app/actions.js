@@ -1,10 +1,9 @@
 "use server";
 
-import { put } from "@vercel/blob";
-import { kv } from "@vercel/kv";
+import { put, get } from "@vercel/blob";
 
-// The "key" we use to find your specific data in the KV database
-const STORE_KEY = "rc-top-10-photos";
+// The "key" we use to find your specific data in Blob Storage
+const STORE_KEY = "rc-top-10-photos.json";
 
 // 1. Upload a new photo file to Vercel Blob Storage
 export async function uploadPhoto(formData) {
@@ -36,8 +35,12 @@ export async function uploadPhoto(formData) {
 // 2. Fetch the photos when anyone visits the page
 export async function getRankings() {
   try {
-    const data = await kv.get(STORE_KEY);
-    return data; // Returns the array of photos, or null if it's empty
+    const response = await get(STORE_KEY);
+    if (!response) {
+      return null;
+    }
+    const text = await response.text();
+    return JSON.parse(text);
   } catch (error) {
     console.error("Failed to fetch rankings:", error);
     return null;
@@ -52,10 +55,13 @@ export async function saveRankings(photos, password) {
   }
   
   try {
-    await kv.set(STORE_KEY, photos);
+    await put(STORE_KEY, JSON.stringify(photos), { 
+      access: "private",
+      contentType: "application/json"
+    });
     return { success: true };
   } catch (error) {
-    console.error("KV save failed:", error);
+    console.error("Blob save failed:", error);
     return { success: false, error: "Failed to save rankings" };
   }
 }
