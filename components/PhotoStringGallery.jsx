@@ -3,14 +3,17 @@
 import { useCallback, useMemo, useRef, useState, useEffect } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 
+// Import your new Server Actions! Adjust the path if your actions.js is somewhere else.
+import { getRankings, saveRankings, uploadPhoto } from "../app/actions";
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 const MAX_PHOTOS = 10;
 const ROWS = 2;
 const PER_ROW = MAX_PHOTOS / ROWS;
-const ITEM_WIDTH = 170; // The fixed size of the invisible "slot" on the string
-const GAP = 48; // Increased gap to allow wider horizontal images to breathe
+const ITEM_WIDTH = 170;
+const GAP = 48;
 const ROW_GAP = 140;
 const DIP_HEIGHT = 48;
 const MIN_ASPECT = 0.65;
@@ -32,20 +35,6 @@ function makePhoto(url = null, aspect = 1) {
     aspect,
     tilt: Math.random() * 8 - 4,
   };
-}
-
-function readFileAsPhotoPayload(file) {
-  return new Promise((resolve) => {
-    const url = URL.createObjectURL(file);
-    const img = new window.Image();
-    img.onload = () => {
-      const raw = img.naturalWidth / (img.naturalHeight || 1);
-      const aspect = Math.min(MAX_ASPECT, Math.max(MIN_ASPECT, raw || 1));
-      resolve({ url, aspect });
-    };
-    img.onerror = () => resolve({ url, aspect: 1 });
-    img.src = url;
-  });
 }
 
 function hangOffset(index, count) {
@@ -74,14 +63,25 @@ function Heart({ className, style }) {
 // ---------------------------------------------------------------------------
 export default function PhotoStringGallery() {
   const [isMounted, setIsMounted] = useState(false);
+  const [isSaving, setIsSaving] = useState(false); // New loading state for uploads
 
-  useEffect(() => {
-    setIsMounted(true);
-  }, []);
-
+  // Start with blank photos, but we will overwrite them when the database loads
   const [photos, setPhotos] = useState(() =>
     Array.from({ length: MAX_PHOTOS }, () => makePhoto(null))
   );
+
+  // Load photos from Vercel KV when the page first opens
+  useEffect(() => {
+    setIsMounted(true);
+    
+    async function loadData() {
+      const savedPhotos = await getRankings();
+      if (savedPhotos && savedPhotos.length === MAX_PHOTOS) {
+        setPhotos(savedPhotos);
+      }
+    }
+    loadData();
+  }, []);
 
   const [fileDragOverIndex, setFileDragOverIndex] = useState(null);
   const [reorderState, setReorderState] = useState({ draggingId: null, hoverIndex: null });
@@ -135,32 +135,77 @@ export default function PhotoStringGallery() {
     }
   };
 
-  const handleDragEnd = (id) => () => {
+  const handleDragEnd = (id) => async () => {
     const from = photos.findIndex((p) => p.id === id);
     const to = reorderState.hoverIndex;
+    
     if (to != null && to !== from) {
-      setPhotos((prev) => moveItem(prev, from, to));
+      // 1. Ask for the password before letting them reorder
+      const password = window.prompt("Admin Password to save this new ranking:");
+      if (!password) {
+        setReorderState({ draggingId: null, hoverIndex: null });
+        return; 
+      }
+
+      const newPhotos = moveItem(photos, from, to);
+      setPhotos(newPhotos); // Update UI instantly
+      
+      // 2. Save it to the database
+      const result = await saveRankings(newPhotos, password);
+      if (!result.success) {
+        alert(result.error || "Failed to save ranking.");
+        setPhotos(photos); // Revert the UI if password was wrong
+      }
     }
     setReorderState({ draggingId: null, hoverIndex: null });
   };
 
-  const insertPhotoAt = useCallback((index, url, aspect) => {
-    setPhotos((prev) => {
-      const next = [...prev];
-      const clampedIndex = Math.max(0, Math.min(index, next.length));
-      next.splice(clampedIndex, 0, makePhoto(url, aspect));
-      next.length = MAX_PHOTOS;
-      return next;
-    });
-  }, []);
+  const processNewPhoto = async (index, file) => {
+    if (!file || !file.type.startsWith("image/")) return;
 
-  const replacePhotoAt = useCallback((index, url, aspect) => {
-    setPhotos((prev) => {
-      const next = [...prev];
-      next[index] = { ...next[index], url, aspect };
-      return next;
-    });
-  }, []);
+    const password = window.prompt("Admin Password to upload this photo:");
+    if (!password) return;
+
+    setIsSaving(true);
+    
+    try {
+      // 1. Upload the physical file to Vercel Blob
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("password", password);
+      
+      const uploadResult = await uploadPhoto(formData);
+      if (!uploadResult.success) {
+        alert(uploadResult.error || "Upload failed.");
+        setIsSaving(false);
+        return;
+      }
+
+      // 2. Calculate the aspect ratio for the UI
+      const url = uploadResult.url;
+      const img = new window.Image();
+      img.onload = async () => {
+        const raw = img.naturalWidth / (img.naturalHeight || 1);
+        const aspect = Math.min(MAX_ASPECT, Math.max(MIN_ASPECT, raw || 1));
+        
+        // 3. Create the new photo array
+        const nextPhotos = [...photos];
+        nextPhotos.splice(index, 0, makePhoto(url, aspect));
+        nextPhotos.length = MAX_PHOTOS;
+        
+        // 4. Update UI and save to database
+        setPhotos(nextPhotos);
+        await saveRankings(nextPhotos, password);
+        setIsSaving(false);
+      };
+      img.src = url;
+
+    } catch (error) {
+      console.error(error);
+      alert("Something went wrong.");
+      setIsSaving(false);
+    }
+  };
 
   const handleFileDragOver = (index) => (e) => {
     e.preventDefault();
@@ -178,19 +223,15 @@ export default function PhotoStringGallery() {
     e.preventDefault();
     setFileDragOverIndex(null);
     const file = e.dataTransfer.files?.[0];
-    if (file && file.type.startsWith("image/")) {
-      const { url, aspect } = await readFileAsPhotoPayload(file);
-      insertPhotoAt(index, url, aspect);
-    }
+    await processNewPhoto(index, file);
   };
 
   const handleFilePicked = async (e) => {
     const file = e.target.files?.[0];
     const index = fileInputTarget.current;
     e.target.value = "";
-    if (file && file.type.startsWith("image/") && index != null) {
-      const { url, aspect } = await readFileAsPhotoPayload(file);
-      replacePhotoAt(index, url, aspect);
+    if (index != null) {
+      await processNewPhoto(index, file);
     }
   };
 
@@ -212,18 +253,21 @@ export default function PhotoStringGallery() {
     []
   );
 
-  if (!isMounted) {
-    return null; 
-  }
+  if (!isMounted) return null;
 
   return (
     <div
       className="relative w-screen h-screen overflow-hidden flex flex-col items-center justify-center"
-      style={{
-        background:
-          "radial-gradient(ellipse at 50% 0%, #fbfaf7 0%, #efece5 65%, #e6e2d9 100%)",
-      }}
+      style={{ background: "radial-gradient(ellipse at 50% 0%, #fbfaf7 0%, #efece5 65%, #e6e2d9 100%)" }}
     >
+      {isSaving && (
+        <div className="absolute inset-0 z-50 bg-white/50 backdrop-blur-sm flex items-center justify-center">
+          <div className="bg-white px-6 py-3 rounded-full shadow-lg text-pink-500 font-bold tracking-wide animate-pulse">
+            Uploading & Saving...
+          </div>
+        </div>
+      )}
+
       <div className="absolute inset-0 pointer-events-none overflow-hidden">
         {bgHearts.map((h, i) => (
           <Heart
@@ -285,9 +329,6 @@ export default function PhotoStringGallery() {
                     reorderState.hoverIndex === index;
                   const isBeingDragged = reorderState.draggingId === photo.id;
 
-                  // Equal-Area Math Strategy: 
-                  // Calculate dynamic width based on aspect ratio so every photo 
-                  // maintains the exact same visual weight.
                   const aspect = photo.aspect || 1;
                   const targetArea = ITEM_WIDTH * ITEM_WIDTH;
                   const optimalWidth = Math.sqrt(targetArea * aspect);
@@ -305,21 +346,17 @@ export default function PhotoStringGallery() {
                       onDragStart={handleDragStart(photo.id)}
                       onDrag={handleDrag(photo.id)}
                       onDragEnd={handleDragEnd(photo.id)}
-                      whileDrag={{
-                        scale: 1.12,
-                        boxShadow: "0 30px 60px rgba(0,0,0,0.35)",
-                      }}
+                      whileDrag={{ scale: 1.12, boxShadow: "0 30px 60px rgba(0,0,0,0.35)" }}
                       initial={{ opacity: 0, scale: 0.4, y: -20 }}
                       animate={{ opacity: 1, scale: 1 }}
                       exit={{ opacity: 0, scale: 0.4 }}
                       style={{
-                        // The invisible "slot" remains fixed so drag-and-drop math works perfectly
                         width: ITEM_WIDTH, 
                         flexShrink: 0,
                         touchAction: "none",
                         zIndex: isBeingDragged ? 50 : 1,
                         display: "flex",
-                        justifyContent: "center", // Perfectly centers the dynamic-width polaroid in its slot
+                        justifyContent: "center",
                       }}
                       className="relative cursor-grab active:cursor-grabbing"
                       onDragOver={handleFileDragOver(index)}
@@ -327,13 +364,10 @@ export default function PhotoStringGallery() {
                       onDrop={handleFileDrop(index)}
                     >
                       <motion.div
-                        animate={{
-                          y: hangOffset(i, rowPhotos.length),
-                          rotate: photo.tilt,
-                        }}
+                        animate={{ y: hangOffset(i, rowPhotos.length), rotate: photo.tilt }}
                         transition={{ type: "spring", stiffness: 260, damping: 24 }}
                         className="relative pointer-events-none"
-                        style={{ width: clampedWidth }} // Apply the dynamic width here
+                        style={{ width: clampedWidth }} 
                       >
                         <div className="absolute -top-4 left-1/2 -translate-x-1/2 z-20 rotate-[-3deg]">
                           <div className="w-4 h-8 rounded-[2px] bg-gradient-to-b from-[#cfa872] to-[#9c7443] shadow-md relative">
@@ -350,9 +384,7 @@ export default function PhotoStringGallery() {
                         <div
                           className={
                             "bg-white p-3 pb-9 shadow-[0_12px_24px_rgba(0,0,0,0.18)] transition-shadow pointer-events-auto " +
-                            (isFileDragTarget || isReorderTarget
-                              ? "ring-4 ring-pink-400 ring-offset-2"
-                              : "")
+                            (isFileDragTarget || isReorderTarget ? "ring-4 ring-pink-400 ring-offset-2" : "")
                           }
                           onDoubleClick={() => {
                             fileInputTarget.current = index;
@@ -401,9 +433,7 @@ export default function PhotoStringGallery() {
       />
 
       <p className="relative z-10 text-center text-sm text-neutral-500 font-medium mt-16 max-w-lg px-6">
-        Drag a photo anywhere across both strings to change your rankings. Drop an
-        image file from your computer onto any slot to insert it there — the photo
-        in 10th place drops off.
+        Drag a photo anywhere to reorder. Drop an image from your computer to insert it. (Requires Admin Password to save changes).
       </p>
     </div>
   );
